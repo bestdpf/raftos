@@ -1,65 +1,112 @@
 import os
 
-from .conf import config
+
+class IPersistentStorage(object):
+
+    def get_content(self, key):
+        raise NotImplementedError
+
+    def write_content(self, key, val):
+        raise NotImplementedError
 
 
-class FileDict:
+class ICacheStorage(IPersistentStorage):
     """Persistent dict-like storage on a disk accessible by obj['item_name']"""
 
-    def __init__(self, filename, serializer=None):
-        self.filename = filename.replace(':', '_')
-        os.makedirs(os.path.dirname(self.filename), exist_ok=True)
-
+    def __init__(self, id):
+        self._id = id
         self.cache = {}
-        self.serializer = serializer or config.serializer
 
     def update(self, kwargs):
-        for key, value in kwargs.items():
-            self[key] = value
+        raise NotImplementedError
 
     def exists(self, name):
-        try:
-            self[name]
-            return True
-
-        except KeyError:
-            return False
+        raise NotImplementedError
 
     def __getitem__(self, name):
         if name not in self.cache:
-            try:
-                content = self._get_file_content()
-                if name not in content:
-                    raise KeyError
-
-            except FileNotFoundError:
-                open(self.filename, 'wb').close()
+            content = self.get_content()
+            if name not in content:
                 raise KeyError
-
             else:
                 self.cache = content
 
         return self.cache[name]
 
     def __setitem__(self, name, value):
-        try:
-            content = self._get_file_content()
-        except FileNotFoundError:
-            content = {}
-
+        content = self.get_content()
         content.update({name: value})
-        with open(self.filename, 'wb') as f:
-            f.write(self.serializer.pack(content))
-
+        self.write_content(None, content)
         self.cache = content
 
-    def _get_file_content(self):
-        with open(self.filename, 'rb') as f:
-            content = f.read()
-            if not content:
-                return {}
+    def write_content(self, key=None, val=None):
+        raise NotImplementedError
 
-        return self.serializer.unpack(content)
+    def get_content(self, key=None):
+        raise NotImplementedError
+
+
+# class FileDict(ICacheStorage):
+#     """Persistent dict-like storage on a disk accessible by obj['item_name']"""
+#
+#     def __init__(self, filename, serializer):
+#         self.filename = filename.replace(':', '_')
+#         os.makedirs(os.path.dirname(self.filename), exist_ok=True)
+#
+#         self.cache = {}
+#         self.serializer = serializer
+#
+#     def update(self, kwargs):
+#         for key, value in kwargs.items():
+#             self[key] = value
+#
+#     def exists(self, name):
+#         try:
+#             self[name]
+#             return True
+#
+#         except KeyError:
+#             return False
+#
+#     def __getitem__(self, name):
+#         if name not in self.cache:
+#             try:
+#                 content = self.get_content()
+#                 if name not in content:
+#                     raise KeyError
+#
+#             except FileNotFoundError:
+#                 open(self.filename, 'wb').close()
+#                 raise KeyError
+#
+#             else:
+#                 self.cache = content
+#
+#         return self.cache[name]
+#
+#     def __setitem__(self, name, value):
+#         try:
+#             content = self.get_content()
+#         except FileNotFoundError:
+#             content = {}
+#
+#         content.update({name: value})
+#         self.write_content(None, content)
+#
+#         self.cache = content
+#
+#     def write_content(self, key=None, val=None):
+#         with open(self.filename, 'wb') as f:
+#             f.write(self.serializer.pack(val))
+#         # self.cache = val
+#
+#     def get_content(self, key=None):
+#         with open(self.filename, 'rb') as f:
+#             content = f.read()
+#             if not content:
+#                 return {}
+#
+#         return self.serializer.unpack(content)
 
 
 class Log:
@@ -75,13 +122,9 @@ class Log:
 
     UPDATE_CACHE_EVERY = 5
 
-    def __init__(self, node_id, serializer=None):
-        self.filename = os.path.join(config.log_path, '{}.log'.format(node_id.replace(':', '_')))
-        os.makedirs(os.path.dirname(self.filename), exist_ok=True)
-        open(self.filename, 'a').close()
-
-        self.serializer = serializer or config.serializer
-        self.cache = self.read()
+    def __init__(self, node_id, persister):
+        self._persister = persister
+        self.cache = self._persister.get_content()
 
         # All States
 
@@ -117,26 +160,28 @@ class Log:
         return len(self.cache)
 
     def write(self, term, command):
-        with open(self.filename, 'ab') as f:
-            entry = {
-                'term': term,
-                'command': command
-            }
-            f.write(self.serializer.pack(entry) + '\n'.encode())
+
+        entry = {
+            'term': term,
+            'command': command
+        }
+
+        index = len(self) % self.UPDATE_CACHE_EVERY
+
+        self._persister.write_content('append', self.cache + [entry])
 
         self.cache.append(entry)
-        if not len(self) % self.UPDATE_CACHE_EVERY:
+        if not index:
             self.cache = self.read()
 
         return entry
 
     def read(self):
-        with open(self.filename, 'rb') as f:
-            return [self.serializer.unpack(entry) for entry in f.readlines()]
+        self._persister.get_content()
 
     def erase_from(self, index):
+        # TODO bug here
         updated = self.cache[:index - 1]
-        open(self.filename, 'wb').close()
         self.cache = []
 
         for entry in updated:
@@ -155,34 +200,34 @@ class Log:
         return 0
 
 
-class StateMachine(FileDict):
+class StateMachine(object):
     """Raft Replicated State Machine — dict"""
 
-    def __init__(self, node_id):
-        filename = os.path.join(config.log_path, '{}.state_machine'.format(node_id))
-        super().__init__(filename)
+    def __init__(self, node_id, persister: ICacheStorage):
+        self._node_id = node_id
+        self._persister = persister
 
     def apply(self, command):
         """Apply command to State Machine"""
 
-        self.update(command)
+        self._persister.update(command)
 
 
-class FileStorage(FileDict):
-    """Persistent storage
-
-    — term — latest term server has seen (initialized to 0 on first boot, increases monotonically)
-    — voted_for — candidate_id that received vote in current term (or None)
-    """
-
-    def __init__(self, node_id):
-        filename = os.path.join(config.log_path, '{}.storage'.format(node_id))
-        super().__init__(filename)
-
-    @property
-    def term(self):
-        return self['term']
-
-    @property
-    def voted_for(self):
-        return self['voted_for']
+# class FileStorage(FileDict):
+#     """Persistent storage
+#
+#     — term — latest term server has seen (initialized to 0 on first boot, increases monotonically)
+#     — voted_for — candidate_id that received vote in current term (or None)
+#     """
+#
+#     def __init__(self, log_path, node_id):
+#         filename = os.path.join(log_path, '{}.storage'.format(node_id))
+#         super().__init__(filename)
+#
+#     @property
+#     def term(self):
+#         return self['term']
+#
+#     @property
+#     def voted_for(self):
+#         return self['voted_for']

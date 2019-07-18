@@ -52,8 +52,6 @@ class Replicated:
 
 
 class ReplicatedContainer(Replicated):
-    async def __getitem__(self, key):
-        return (await self.get()).__getitem__(key)
 
     async def length(self):
         data = await self.get()

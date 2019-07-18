@@ -3,10 +3,10 @@ import functools
 import random
 import time
 
-from .conf import config
 from .exceptions import NotALeaderException
-from .storage import FileStorage, Log, StateMachine
+from .storage import Log, StateMachine, ICacheStorage
 from .timer import Timer
+from . import consts as CONST
 
 
 def validate_term(func):
@@ -135,9 +135,9 @@ class Leader(BaseState):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
-        self.heartbeat_timer = Timer(config.heartbeat_interval, self.heartbeat)
+        self.heartbeat_timer = Timer(CONST.heartbeat_interval, self.heartbeat)
         self.step_down_timer = Timer(
-            config.step_down_missed_heartbeats * config.heartbeat_interval,
+            CONST.step_down_missed_heartbeats * CONST.heartbeat_interval,
             self.state.to_follower
         )
 
@@ -342,7 +342,7 @@ class Candidate(BaseState):
 
     @staticmethod
     def election_interval():
-        return random.uniform(*config.election_interval)
+        return random.uniform(*CONST.election_interval)
 
 
 class Follower(BaseState):
@@ -378,7 +378,7 @@ class Follower(BaseState):
 
     @staticmethod
     def election_interval():
-        return random.uniform(*config.election_interval)
+        return random.uniform(*CONST.election_interval)
 
     @validate_commit_index
     @validate_term
@@ -496,13 +496,13 @@ class State:
     wait_until_leader_id = None
     wait_until_leader_future = None
 
-    def __init__(self, server):
+    def __init__(self, server, storage: ICacheStorage, log_storage: ICacheStorage):
         self.server = server
         self.id = self._get_id(server.host, server.port)
         self.__class__.loop = self.server.loop
-
-        self.storage = FileStorage(self.id)
-        self.log = Log(self.id)
+        # TODO 这里需要回头改一下
+        self.storage = storage(self.id)
+        self.log = Log(self.id, log_storage)
         self.state_machine = StateMachine(self.id)
 
         self.state = Follower(self)
@@ -554,18 +554,14 @@ class State:
     def to_leader(self):
         self._change_state(Leader)
         self.set_leader(self.state)
-        if asyncio.iscoroutinefunction(config.on_leader):
-            asyncio.ensure_future(config.on_leader())
-        else:
-            config.on_leader()
+        asyncio.ensure_future(self.server.async_on_leader())
+        self.server.on_leader()
 
     def to_follower(self):
         self._change_state(Follower)
         self.set_leader(None)
-        if asyncio.iscoroutinefunction(config.on_follower):
-            asyncio.ensure_future(config.on_follower())
-        else:
-            config.on_follower()
+        asyncio.ensure_future(self.server.async_on_follower)
+        self.server.on_follower()
 
     def set_leader(self, leader):
         cls = self.__class__
